@@ -15,18 +15,18 @@ Build from the repository's Dockerfile. Mount a persistent writable volume at /d
 - PORT: 8080 (Docker default)
 - AUTO_START: false initially
 
-The entire dashboard and API require HTTP Basic login in hosted mode. Use HTTPS, supplied by your host/reverse proxy. Do not expose HTTP publicly: Basic login credentials require TLS protection.
+The dashboard uses an HTML sign-in page and a signed HttpOnly session cookie. Use HTTPS supplied by your host/reverse proxy. The public /healthz endpoint returns only a liveness signal.
 
 For your own Docker server: copy .env.example to .env, change login and PUBLIC_URL, then run `docker compose up -d --build`. Compose exposes port 8080 only on the server's loopback interface; configure your HTTPS reverse proxy for 127.0.0.1:8080. The named Docker volume persists the database and encryption key. Back up the whole volume privately, together.
 
 ## Enable live publishing
-Open the assigned HTTPS URL and sign in. The initial workspace is DEMO with sample deliveries; it has not contacted your accounts.
+Open the assigned HTTPS URL and sign in. The hosted workspace starts in LIVE setup with no fake deliveries. It does not contact or publish to your accounts until you configure the credentials and start the worker. Local development still offers demo mode.
 
 1. Connections: save X bearer token and Telegram bot token. Give the bot Post Messages permission in each channel; verify connections.
 2. Send Telegram test only if you want a real labelled broadcast.
 3. Automation settings: select Live and Automatic. Save.
 4. Start automation. By default the initial scan records a baseline, so only newer X posts publish.
-5. After confirming live setup, set AUTO_START=true in your host and restart. Future restarts resume the saved mode automatically. Keep AUTO_START=false if you prefer manual startup after a restart.
+5. After you explicitly start the worker, its resume intent is saved. With AUTO_START unset, restarts resume a previously running worker. Pause clears that intent. AUTO_START=false forces manual startup after every restart; AUTO_START=true explicitly starts on every restart. Missing keys hold startup without taking down the dashboard.
 
 A saved Telegram-only connection is insufficient for X monitoring. Official X API access is required and may have usage charges. Keep tokens out of GitHub. Existing CMC extension automation is separate; this server does not publish to CMC or Instagram.
 
@@ -34,3 +34,8 @@ A saved Telegram-only connection is insufficient for X monitoring. Official X AP
 `pnpm test` checks the worker with mocked APIs. `pnpm run build:host` builds the standalone production dashboard. These checks do not verify your real account credentials, the host's outbound connectivity or successful public delivery. Test a real post after deployment.
 
 Delivery history, duplicate checks, review previews, captions and multiple Telegram channels are supported. Unknown Telegram outcomes require checking the actual channel before retrying. Restart recovery marks interrupted sends uncertain. Duplicate checks cannot provide an absolute exactly-once guarantee across a network failure.
+
+## Live connection options
+Save credentials in Connections, then click Verify & enable live mode. This validates both accounts without broadcasting. You can also supply X_BEARER_TOKEN and TELEGRAM_BOT_TOKEN privately through your host environment; they are imported into encrypted local storage at startup and never sent back to the dashboard. Source defaults to BitcoinWorldN; destination defaults to @News982192. Host environment values override stored tokens on restart while present.
+
+Your API tokens and persistent disk are still required for actual dependable operation. Selecting Live is not proof that permissions or API credits are valid.

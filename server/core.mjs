@@ -9,16 +9,16 @@ export const hash=s=>createHash('sha256').update(norm(s)).digest('hex');
 export const split=(text,max)=>{const a=[];while(text.length){let n=Math.min(max,text.length);if(n<text.length&&/[\uD800-\uDBFF]/.test(text[n-1]))n--;a.push(text.slice(0,n));text=text.slice(n);}return a;};
 const json=v=>JSON.stringify(v),parse=(s,f={})=>{try{return JSON.parse(s);}catch{return f;}};
 export class Publisher {
- constructor(dir,{network=fetch}={}){
+ constructor(dir,{network=fetch,initialMode='demo',seedDemo=true}={}){
   mkdirSync(dir,{recursive:true,mode:0o700});chmodSync(dir,0o700);const keyfile=path.join(dir,'secrets.key');
   if(!existsSync(keyfile))writeFileSync(keyfile,randomBytes(32),{mode:0o600});this.key=readFileSync(keyfile);
   this.db=new DatabaseSync(path.join(dir,'publisher.sqlite'));this.network=network;this.started=Date.now();this.busy=false;this.nextPoll=0;
   this.db.exec(`PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS posts(id TEXT PRIMARY KEY,source_id TEXT,mode TEXT,username TEXT,text TEXT,caption TEXT,media TEXT,created INTEGER,detected INTEGER,approved INTEGER,title TEXT,UNIQUE(mode,source_id));CREATE TABLE IF NOT EXISTS deliveries(id TEXT PRIMARY KEY,post_id TEXT,channel TEXT,mode TEXT,status TEXT,caption TEXT,fingerprint TEXT,created INTEGER,updated INTEGER,error TEXT DEFAULT '',link TEXT,messages TEXT DEFAULT '[]',UNIQUE(post_id,channel));CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,level TEXT,message TEXT,created INTEGER);`);
-  if(!this.get('config'))this.put('config',defaults);
+  if(!this.get('config'))this.put('config',{...defaults,mode:initialMode==='live'?'live':'demo'});
   this.db.prepare("UPDATE deliveries SET status='uncertain',error='Server restarted during delivery. Verify Telegram before retrying.' WHERE status='sending'").run();
   // Explicit start is required after a server restart. No surprise live broadcasts.
   this.running=false;this.phase='paused';this.lastPoll=this.get('lastPoll',null);this.lastError='';
-  if(!this.get('seeded'))this.seed();
+  if(seedDemo&&!this.get('seeded'))this.seed();
  }
  get(k,f=null){const r=this.db.prepare('SELECT value FROM kv WHERE key=?').get(k);return r?parse(r.value,f):f;}
  put(k,v){this.db.prepare('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k,json(v));}
@@ -51,9 +51,9 @@ export class Publisher {
   }
   this.put('seeded',true);this.event('Workspace ready in demo mode. Sample posts do not publish externally.');
  }
- ingest(p,{mode=this.config().mode,approved=this.config().posting==='auto',seed=false}={}){
+ ingest(p,{mode=this.config().mode,approved=this.config().posting==='auto',seed=false,force=false}={}){
   const c=this.config(),types=p.media?.length?p.media.map(m=>m.type):['text'];
-  if(types.some(type=>!c.formats.includes(type)))return null;
+  if(!force&&types.some(type=>!c.formats.includes(type)))return null;
   const id=randomUUID(),caption=this.caption(p.text),now=Date.now();
   const r=this.db.prepare('INSERT OR IGNORE INTO posts(id,source_id,mode,username,text,caption,media,created,detected,approved,title) VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(id,p.source_id,mode,c.sourceUsername,p.text,caption,json(p.media||[]),p.created||now,now,approved?1:0,p.title||'');
   if(!r.changes)return null;
@@ -67,8 +67,15 @@ export class Publisher {
   const days=Array.from({length:7},(_,i)=>{const date=new Date(Date.now()-(6-i)*86400000),start=new Date(date.getFullYear(),date.getMonth(),date.getDate()).getTime();const n=this.db.prepare("SELECT COUNT(*) AS n FROM deliveries WHERE mode=? AND status IN ('sent','demo_sent') AND updated>=? AND updated<?").get(c.mode,start,start+86400000).n;return{label:date.toLocaleDateString('en-US',{weekday:'short'}),count:Number(n)};});
   return{config:c,secrets:{hasXToken:!!sec.xToken,hasBotToken:!!sec.botToken},checks:this.get('checks',{}),running:this.running,phase:this.phase,busy:this.busy,lastPoll:this.lastPoll,nextPoll:this.nextPoll,lastError:this.lastError,uptime:Date.now()-this.started,counts,postCount:this.db.prepare('SELECT COUNT(*) AS n FROM posts WHERE mode=?').get(c.mode).n,posts,history,events:this.db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 40').all(),days};
  }
- start(){const c=this.config(),s=this.secrets();if(c.mode==='live'&&(!s.xToken||!s.botToken))throw Error('Add your X bearer token and Telegram bot token in Connections before starting live automation.');this.running=true;this.nextPoll=0;this.phase='waiting';this.event(c.mode==='demo'?'Demo worker started. No external posts will be sent.':'Live worker started. New X posts will publish to your configured Telegram channels.');}
- pause(){this.running=false;this.phase=this.busy?'finishing current operation':'paused';this.event('Worker paused. An already accepted Telegram request cannot be recalled.');}
+ start(){const c=this.config(),s=this.secrets();if(c.mode==='live'&&(!s.xToken||!s.botToken))throw Error('Add your X bearer token and Telegram bot token in Connections before starting live automation.');this.put('resumeRequested',true);this.running=true;this.nextPoll=0;this.phase='waiting';this.event(c.mode==='demo'?'Demo worker started. No external posts will be sent.':'Live worker started. New X posts will publish to your configured Telegram channels.');}
+ pause(){this.put('resumeRequested',false);this.running=false;this.phase=this.busy?'finishing current operation':'paused';this.event('Worker paused. An already accepted Telegram request cannot be recalled.');}
+ async enableLive(){
+  if(this.running||this.busy)throw Error('Pause the worker before enabling live mode.');
+  if(!this.secrets().xToken||!this.secrets().botToken)throw Error('Save your X bearer token and Telegram bot token in Connections first.');
+  this.busy=true;this.phase='verifying live connections';
+  try{await this.check('x');await this.check('telegram');this.put('config',{...this.config(),mode:'live'});this.nextPoll=0;this.event('Live connections verified. Start automation to monitor and publish new posts.');return this.state();}
+  finally{this.busy=false;this.phase='paused';}
+ }
  async x(pathname,query={}){const token=this.secrets().xToken;if(!token)throw Error('Add an X bearer token in Connections.');const url=new URL('https://api.x.com'+pathname);for(const[k,v]of Object.entries(query))url.searchParams.set(k,String(v));let r;try{r=await this.network(url,{headers:{Authorization:'Bearer '+token},signal:AbortSignal.timeout(25000)});}catch{throw Error('Cannot reach X. Check network access and the bearer token.');}let body;try{body=await r.json();}catch{throw Error('X returned an unreadable response.');}if(!r.ok)throw Error(`X request failed (${r.status}). ${body.detail||body.title||'Check API access, credits and rate limits.'}`);return body;}
  async lookup(){const c=this.config(),k='xUser:'+c.sourceUsername.toLowerCase();let cached=this.get(k);if(!cached){const r=await this.x('/2/users/by/username/'+encodeURIComponent(c.sourceUsername));if(!r.data?.id)throw Error('X account could not be resolved.');cached=r.data;this.put(k,cached);}return cached;}
  async telegram(method,data){const token=this.secrets().botToken;if(!token)throw Error('Add your Telegram bot token first.');let r,b;try{r=await this.network(`https://api.telegram.org/bot${token}/${method}`,{method:'POST',headers:{'Content-Type':'application/json'},body:json(data),signal:AbortSignal.timeout(25000)});b=await r.json();}catch{const e=Error('Telegram connection interrupted. Check the channel before retrying.');e.uncertain=true;throw e;}if(!b.ok)throw Error(b.description||'Telegram rejected the request.');return b.result;}
@@ -88,7 +95,7 @@ export class Publisher {
   const byKey=new Map(media.map(m=>[m.media_key,m]));let last=null;
   if(!since&&c.newOnly&&!preview){if(newest)this.put(baselineKey,newest);this.event('X baseline saved. Only posts newer than this first scan will publish. Use Fetch latest preview to review an existing post.');}
   else for(const p of raw.sort((a,b)=>BigInt(a.id)<BigInt(b.id)?-1:1).slice(preview?-1:0)){
-   const assets=(p.attachments?.media_keys||[]).map(key=>byKey.get(key)).filter(Boolean).map(m=>{if(m.type==='photo')return{type:'photo',url:m.url,poster:m.url};const v=(m.variants||[]).filter(v=>v.content_type==='video/mp4').sort((a,b)=>(a.bit_rate||0)-(b.bit_rate||0));return{type:m.type==='animated_gif'?'animation':'video',url:(v.find(v=>(v.bit_rate||0)>=256000)||v[0])?.url||'',poster:m.preview_image_url||''};});
+   const assets=(p.attachments?.media_keys||[]).map(key=>byKey.get(key)).filter(Boolean).map(m=>{if(m.type==='photo')return{type:'photo',url:m.url,poster:m.url};const v=(m.variants||[]).filter(v=>(v.content_type||v.type)==='video/mp4').sort((a,b)=>(a.bit_rate||a.bitrate||0)-(b.bit_rate||b.bitrate||0));return{type:m.type==='animated_gif'?'animation':'video',url:(v.find(v=>(v.bit_rate||v.bitrate||0)>=256000)||v[0])?.url||'',poster:m.preview_image_url||''};});
    let text=p.note_post?.text||p.note_tweet?.text||p.text||'';for(const u of p.entities?.urls||[])if(u.expanded_url)text=text.split(u.url).join(u.expanded_url);
    last=this.ingest({source_id:p.id,text,media:assets,created:Date.parse(p.created_at)||Date.now()},{approved:!preview&&c.posting==='auto'});
   }
@@ -98,7 +105,7 @@ export class Publisher {
  editPost(id,caption){const p=this.db.prepare('SELECT * FROM posts WHERE id=?').get(id);if(!p)throw Error('Post not found.');if(typeof caption!=='string'||caption.length>100000)throw Error('Caption must be under 100,000 characters.');const active=this.db.prepare("SELECT id FROM deliveries WHERE post_id=? AND status IN ('sending','sent','demo_sent','uncertain')").get(id);if(active)throw Error('Delivered or uncertain posts cannot be edited. Create a new source post instead.');this.db.prepare('UPDATE posts SET caption=? WHERE id=?').run(caption,id);this.db.prepare('UPDATE deliveries SET caption=?,fingerprint=? WHERE post_id=?').run(caption,hash(caption),id);this.event('Preview caption saved.');}
  approve(id){if(!this.db.prepare('SELECT id FROM posts WHERE id=?').get(id))throw Error('Post not found.');this.db.prepare('UPDATE posts SET approved=1 WHERE id=?').run(id);this.event('Selected post approved for its waiting destinations.');}
  skip(id){this.db.prepare("UPDATE deliveries SET status='skipped',error='Skipped by you',updated=? WHERE post_id=? AND status='waiting'").run(Date.now(),id);this.event('Selected waiting post skipped.');}
- retry(id,{verifiedAbsent=false}={}){const d=this.db.prepare('SELECT * FROM deliveries WHERE id=?').get(id);if(!d||!['failed','uncertain'].includes(d.status))throw Error('Only failed or uncertain deliveries can be retried.');if(d.status==='uncertain'&&!verifiedAbsent)throw Error('Check Telegram first, then confirm the post is absent before retrying.');this.db.prepare("UPDATE deliveries SET status='waiting',error='',updated=? WHERE id=?").run(Date.now(),id);this.approve(d.post_id);this.event('Retry queued only for the selected channel.');}
+ retry(id,{verifiedAbsent=false}={}){if(this.busy)throw Error('Wait for the current delivery before retrying.');const d=this.db.prepare('SELECT * FROM deliveries WHERE id=?').get(id);if(!d||!['failed','uncertain'].includes(d.status))throw Error('Only failed or uncertain deliveries can be retried.');if(d.status==='uncertain'&&!verifiedAbsent)throw Error('Check Telegram first, then confirm the post is absent before retrying.');this.db.prepare("UPDATE deliveries SET status='waiting',error='',updated=? WHERE id=?").run(Date.now(),id);this.approve(d.post_id);this.event('Retry queued only for the selected channel.');}
  async publish(d,p){
   let media=parse(p.media,[]),caption=d.caption,blobs=[],fallback='';const results=[];
   try{for(const m of media){const u=new URL(m.url);if(u.protocol!=='https:'||!['pbs.twimg.com','video.twimg.com'].includes(u.hostname))throw Error('Downloadable media unavailable.');const r=await this.network(u,{signal:AbortSignal.timeout(25000)});if(!r.ok)throw Error('Media download failed.');const cap=(m.type==='photo'?10:50)*1024*1024;if(Number(r.headers.get('content-length')||0)>cap)throw Error('Media exceeds Telegram upload limit.');const blob=await r.blob();if(blob.size>cap)throw Error('Media exceeds Telegram upload limit.');blobs.push(blob);}}catch(e){fallback=e.message;media=[];caption+='\n\nhttps://x.com/'+p.username+'/status/'+p.source_id;}
@@ -129,7 +136,7 @@ export class Publisher {
   finally{this.busy=false;this.phase=this.running?'waiting':'paused';}return true;
  }
  async sendApproved(id){if(this.busy)throw Error('Worker is busy. Wait for the current operation.');this.approve(id);while(await this.deliverOne({postId:id,manual:true})){}return this.state();}
- async testTelegram(){if(this.busy)throw Error('Wait for the current operation.');const c=this.config();if(!this.secrets().botToken)throw Error('Add your Telegram bot token first.');const id=this.ingest({source_id:'test-'+Date.now(),text:'BitcoinWorld Publisher connection test.\nThis is a test message, not a market update.\n'+new Date().toISOString(),media:[],title:'Telegram connection test'},{mode:'live',approved:true});if(c.mode==='live'){while(await this.deliverOne({postId:id,manual:true})){}return;} // Test while demo mode requires explicit, isolated delivery.
+ async testTelegram(){if(this.busy)throw Error('Wait for the current operation.');const c=this.config();if(!this.secrets().botToken)throw Error('Add your Telegram bot token first.');const id=this.ingest({source_id:'test-'+Date.now(),text:'BitcoinWorld Publisher connection test.\nThis is a test message, not a market update.\n'+new Date().toISOString(),media:[],title:'Telegram connection test'},{mode:'live',approved:true,force:true});if(c.mode==='live'){while(await this.deliverOne({postId:id,manual:true})){}return;} // Test while demo mode requires explicit, isolated delivery.
   const post=this.db.prepare('SELECT * FROM posts WHERE id=?').get(id);const rows=this.db.prepare('SELECT * FROM deliveries WHERE post_id=?').all(id);this.busy=true;try{for(const d of rows){this.db.prepare("UPDATE deliveries SET status='sending' WHERE id=?").run(d.id);try{const out=await this.publish(d,post);this.db.prepare("UPDATE deliveries SET status='sent',link=?,messages=?,updated=? WHERE id=?").run(out.link,json(out.messages),Date.now(),d.id);}catch(e){this.db.prepare('UPDATE deliveries SET status=?,error=?,updated=? WHERE id=?').run(e.uncertain?'uncertain':'failed',e.message,Date.now(),d.id);throw e;}}this.event('Telegram test message delivered.','info');}finally{this.busy=false;}
  }
  async tick(){if(!this.running||this.busy)return;const c=this.config();if(Date.now()>=this.nextPoll){this.nextPoll=Date.now()+(c.mode==='demo'?45000:c.pollSeconds*1000);try{await this.guardedPoll();}catch{};}if(this.running&&!this.busy)await this.deliverOne();}
