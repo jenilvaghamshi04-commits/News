@@ -29,3 +29,6 @@ test('live video and GIF use actual Telegram media methods',async t=>{
  const methods=[];const {p}=setup(t,async(u,options)=>{if(String(u).startsWith('https://video.twimg.com/'))return new Response(new Uint8Array([1,2,3]),{headers:{'Content-Type':'video/mp4'}});methods.push(String(u).split('/').at(-1));assert.ok(options.body instanceof FormData);return Response.json({ok:true,result:{message_id:20+methods.length}});});p.save({mode:'live',xToken:'dummy',botToken:'123:dummy',hashtags:''});
  for(const type of ['video','animation']){const id=p.ingest({source_id:type,text:type+' caption',media:[{type,url:'https://video.twimg.com/test.mp4'}]});await p.sendApproved(id);assert.equal(row(p,id)[0].status,'sent');}assert.deepEqual(methods,['sendVideo','sendAnimation']);
 });
+test('verification checks timeline access even when a user ID is cached',async t=>{
+ const {p}=setup(t,async u=>String(u).includes('/by/username/')?Response.json({data:{id:'42',username:'BitcoinWorldN'}}):Response.json({detail:'Timeline access unavailable'},{status:403}));p.save({xToken:'dummy',botToken:'123:dummy'});p.put('xUser:bitcoinworldn',{id:'42',username:'BitcoinWorldN'});await assert.rejects(()=>p.enableLive(),/Timeline access unavailable/);assert.equal(p.config().mode,'demo');assert.equal(p.state().checks.x.ok,false);
+});
