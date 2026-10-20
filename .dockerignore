@@ -1,0 +1,11 @@
+node_modules
+.localdata
+.sites-runtime
+.wrangler
+.git
+dist
+.next
+host-dist
+.env
+.env.*
+*.zip
