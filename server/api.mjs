@@ -7,15 +7,18 @@ import {Publisher} from './core.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 export const publisher=new Publisher(process.env.PUBLISHER_DATA_DIR||path.join(root,'.localdata'));
 const hosted=process.env.PUBLISHER_HOSTED==='true';
+const externalUrl=process.env.PUBLIC_URL||process.env.RENDER_EXTERNAL_URL;
 const port=Number(hosted?(process.env.PORT||8080):(process.env.PUBLISHER_API_PORT||4319));
-if(hosted&&(!process.env.ADMIN_USER||!process.env.ADMIN_PASSWORD||process.env.ADMIN_PASSWORD.length<16||!process.env.PUBLIC_URL))throw Error('Hosted mode requires ADMIN_USER, ADMIN_PASSWORD (16+ characters), and PUBLIC_URL.');
+if(hosted&&(!process.env.ADMIN_USER||!process.env.ADMIN_PASSWORD||process.env.ADMIN_PASSWORD.length<16||!externalUrl))throw Error("Hosted mode requires ADMIN_USER, ADMIN_PASSWORD (16+ characters), and PUBLIC_URL (or Render automatic RENDER_EXTERNAL_URL).");
 const equal=(a,b)=>{const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length&&timingSafeEqual(x,y);};
 const allowed=new Set(['localhost','127.0.0.1','terminal.local']);
-const publicOrigin=process.env.PUBLIC_URL?new URL(process.env.PUBLIC_URL).origin:null;
+const publicOrigin=externalUrl?new URL(externalUrl).origin:null;
 const server=http.createServer(async(req,res)=>{
  res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Content-Type','application/json');
  const reply=(code,data)=>{res.writeHead(code);res.end(JSON.stringify(data));};
  try{
+  // Public liveness only: never returns configuration, credentials or history.
+  if(req.method==='GET'&&req.url==='/healthz')return reply(200,{ok:true});
   if(hosted){const expected='Basic '+Buffer.from(process.env.ADMIN_USER+':'+process.env.ADMIN_PASSWORD).toString('base64');if(!equal(req.headers.authorization||'',expected)){res.setHeader('WWW-Authenticate','Basic realm="BitcoinWorld Publisher", charset="UTF-8"');return reply(401,{error:'Sign in required.'});}}
   if(hosted&&req.headers.origin&&req.headers.origin!==publicOrigin)return reply(403,{error:'Cross-site request rejected.'});
   if(!hosted&&req.headers.origin&&!allowed.has(new URL(req.headers.origin).hostname))return reply(403,{error:'Cross-site request rejected.'});
